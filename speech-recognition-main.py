@@ -30,9 +30,11 @@ MIC_CHANNELS = 1
 MIC_DTYPE = "int16"
 
 FRAME_MS = 30
-START_THRESHOLD_RMS = 0.015
-STOP_THRESHOLD_RMS = 0.010
+START_THRESHOLD_RMS = 0.010
+STOP_THRESHOLD_RMS = 0.007
 PRE_ROLL_MS = 250
+POST_ROLL_MS = 250
+RMS_SMOOTH_FRAMES = 4
 MIN_UTTERANCE_SECONDS = 0.40
 SILENCE_STOP_SECONDS = 0.60
 MAX_UTTERANCE_SECONDS = 12.0
@@ -625,11 +627,15 @@ def continuous_utterance_record_and_transcribe(
     min_samples = int(MIN_UTTERANCE_SECONDS * MIC_SR)
 
     pre_roll = np.zeros((0,), dtype=np.float32)
+    post_roll_frames = max(1, int(POST_ROLL_MS / FRAME_MS))
     recording = False
     utter_frames: List[np.ndarray] = []
     silent_frames = 0
     frames_in_utt = 0
     ring = np.zeros((0,), dtype=np.float32)
+    
+    rms_history: List[float] = []
+    last_voiced_idx = -1
 
     def callback(indata, frames, time_info, status):
         nonlocal ring
@@ -698,6 +704,10 @@ def continuous_utterance_record_and_transcribe(
                 ring = ring[frame_len:]
 
                 e = rms(frame)
+                rms_history.append(e)
+                if len(rms_history) > RMS_SMOOTH_FRAMES:
+                    rms_history.pop(0)
+                e_smooth = sum(rms_history) / len(rms_history)
 
                 pre_roll = np.concatenate([pre_roll, frame])
                 if pre_roll.shape[0] > pre_roll_len:
@@ -709,6 +719,7 @@ def continuous_utterance_record_and_transcribe(
                         utter_frames = [pre_roll.copy()]
                         silent_frames = 0
                         frames_in_utt = 0
+                        last_voiced_idx = 0
                     continue
 
                 utter_frames.append(frame)
@@ -723,11 +734,15 @@ def continuous_utterance_record_and_transcribe(
                 enough_silence = silent_frames >= silence_stop_frames
 
                 if enough_silence or too_long:
+                    cut_end = min(len(utter_frames), last_voiced_idx + post_roll_frames)
                     samples = np.concatenate(utter_frames, axis=0)
+                    
                     recording = False
                     utter_frames = []
                     silent_frames = 0
                     frames_in_utt = 0
+                    rms_history = []
+                    last_voiced_idx = -1
 
                     if samples.shape[0] < min_samples:
                         continue
