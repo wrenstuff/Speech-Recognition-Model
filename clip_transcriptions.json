@@ -1,0 +1,11 @@
+{
+  "": {
+    "uid": null,
+    "transcript": null,
+    "confidence": null,
+    "label": null,
+    "confirmed": null,
+    "model_suggestion": null,
+    "model_confidence": null
+  }
+}
