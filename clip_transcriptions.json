@@ -7,5 +7,32 @@
     "confirmed": null,
     "model_suggestion": null,
     "model_confidence": null
+  },
+  "001-wren_20251231-152713_5847.wav": {
+    "uid": "001-wren",
+    "transcript": null,
+    "confidence": 0.9545890986919403,
+    "label": null,
+    "confirmed": false,
+    "model_suggestion": "test",
+    "model_confidence": 0.9545890986919403
+  },
+  "001-wren_20251231-152718_1107.wav": {
+    "uid": "001-wren",
+    "transcript": null,
+    "confidence": 0.8453742861747742,
+    "label": null,
+    "confirmed": false,
+    "model_suggestion": "cou",
+    "model_confidence": 0.8453742861747742
+  },
+  "001-wren_20251231-152721_7088.wav": {
+    "uid": "001-wren",
+    "transcript": null,
+    "confidence": 0.831320678194364,
+    "label": null,
+    "confirmed": false,
+    "model_suggestion": "note porfirk",
+    "model_confidence": 0.831320678194364
   }
 }

@@ -6,6 +6,8 @@ import re
 import sys
 import time
 import wave
+import math
+import torch
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,10 +22,11 @@ CLIP_DB_PATH = Path("clip_transcriptions.json")
 VOCAB_PATH = Path("vocab.json")
 SETTINGS_PATH = Path("settings.json")
 
-CONFIDENCE_THRESHOLD = 0.95
+CONFIDENCE_THRESHOLD = 0.99
 VERY_SHORT_TRANSCRIPT_LEN = 2
 RANDOM_SAMPLE_COUNT = 100
 WORD_REGEX = re.compile(r"[A-Za-z']+")
+TOKEN_REGEX = re.compile(r"<[^<> \t\r\n]+>")
 
 MIC_SR = 16000
 MIC_CHANNELS = 1
@@ -245,7 +248,15 @@ def normalize_word(token: str) -> str:
 
 
 def update_vocab_from_transcript(transcript: str, vocab: Dict[str, Dict[str, Any]]):
-    tokens = tokenize(transcript)
+    if not transcript:
+        return
+
+    special_tokens = TOKEN_REGEX.findall(transcript)
+    update_vocab_from_tokens(special_tokens, vocab)
+
+    clean = TOKEN_REGEX.sub(" ", transcript)
+
+    tokens = tokenize(clean)
     for tok in tokens:
         key = normalize_word(tok)
         if not key:
@@ -253,6 +264,15 @@ def update_vocab_from_transcript(transcript: str, vocab: Dict[str, Dict[str, Any
         if key not in vocab:
             vocab[key] = {"count": 0, "transcription": tok}
         vocab[key]["count"] += 1
+
+        
+        
+def update_vocab_from_tokens(tokens: List[str], vocab: Dict[str, Dict[str, Any]]):
+    for tok in tokens:
+        if tok not in vocab:
+            vocab[tok] = {"count": 0, "transcription": tok}
+        vocab[tok]["count"] += 1
+
 
 
 def rms(x: np.ndarray) -> float:
@@ -524,6 +544,33 @@ def process_clip(
     print("Saved as UNLABELED.")
     return (not was_confirmed)
 
+def _pad_1d_batch(waves: List[np.ndarray]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    waves: list of float32 numpy arrays in [-1,1], mono, varying lengths
+    returns:
+      x: (B, T) float32 tensor (CPU) padded with zeros
+      lengths: (B,) int64 tensor of original lengths
+    """
+    lengths = torch.tensor([w.shape[0] for w in waves], dtype=torch.int64)
+    max_len = int(lengths.max().item()) if len(waves) else 0
+    x = torch.zeros((len(waves), max_len), dtype=torch.float32)
+    for i, w in enumerate(waves):
+        if w.size == 0:
+            continue
+        x[i, : w.shape[0]] = torch.from_numpy(w)
+    return x, lengths
+
+
+def _chunked(iterable, n: int):
+    buf = []
+    for item in iterable:
+        buf.append(item)
+        if len(buf) >= n:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
 
 def auto_label_clips(
     all_clips: List[Path],
@@ -534,30 +581,56 @@ def auto_label_clips(
     threshold: float,
     only_unconfirmed: bool,
     save_every: int = 25,
+    batch_size: int = 32,
+    use_amp: bool = True,
+    max_batch_seconds: float = 45.0,
 ) -> None:
+    """
+    CUDA-friendly auto-labeling:
+      - loads audio on CPU
+      - groups into batches
+      - calls asr_model.transcribe_batch(sr, waves, lengths, ...) if available
+      - falls back to per-clip if batch not supported
+    """
+
+    # Decide whether batch API exists
+    has_batch = hasattr(asr_model, "transcribe_batch") and callable(getattr(asr_model, "transcribe_batch"))
+
     processed = 0
     accepted = 0
     skipped_confirmed_speech = 0
 
-    for clip_path in tqdm(all_clips, desc="Auto-labeling"):
+    # Build a worklist first (so tqdm total is correct even with skipping)
+    work: List[Path] = []
+    for clip_path in all_clips:
         key = clip_path.name
         existing = clip_db.get(key) or {}
         was_confirmed = bool(existing.get("confirmed"))
         was_label = existing.get("label")
-        uid = ensure_uid(existing, key)
 
         if only_unconfirmed and was_confirmed:
             continue
         if was_confirmed and was_label == "speech":
             skipped_confirmed_speech += 1
             continue
+        work.append(clip_path)
 
+    if not work:
+        print("\nAuto-label summary")
+        print("Nothing to do.")
+        print(f"Skipped confirmed speech: {skipped_confirmed_speech}")
+        return
+
+    # Load + sort by length to reduce padding overhead
+    loaded: List[Tuple[Path, int, np.ndarray]] = []
+    for clip_path in tqdm(work, desc="Loading audio"):
+        key = clip_path.name
         try:
             sr, audio = load_wav_mono(clip_path)
-            result: ASRResult = asr_model.transcribe(sr, audio)
-            model_transcript = (result.transcript or "").strip()
-            conf = float(getattr(result, "confidence", 0.0) or 0.0)
+            loaded.append((clip_path, sr, audio))
         except Exception as e:
+            existing = clip_db.get(key) or {}
+            uid = ensure_uid(existing, key)
             clip_db[key] = {
                 "uid": uid,
                 "transcript": existing.get("transcript"),
@@ -567,27 +640,140 @@ def auto_label_clips(
                 "error": str(e),
             }
             processed += 1
-            continue
 
-        if should_auto_accept(model_transcript, conf, threshold):
-            clip_db[key] = {"uid": uid, "transcript": model_transcript, "confidence": conf, "label": "speech", "confirmed": True}
-            update_vocab_from_transcript(model_transcript, vocab)
-            accepted += 1
-        else:
-            clip_db[key] = {
-                "uid": uid,
-                "transcript": existing.get("transcript"),
-                "confidence": existing.get("confidence", 0.0),
-                "label": existing.get("label"),
-                "confirmed": bool(existing.get("confirmed", False)),
-                "model_suggestion": model_transcript,
-                "model_confidence": conf,
-            }
+    if not loaded:
+        print("\nAuto-label summary")
+        print("No audio loaded successfully.")
+        print(f"Processed               : {processed}")
+        print(f"Auto-accepted (speech)  : {accepted}")
+        print(f"Skipped confirmed speech: {skipped_confirmed_speech}")
+        return
 
-        processed += 1
-        if processed % save_every == 0:
-            save_json(CLIP_DB_PATH, clip_db)
-            save_json(VOCAB_PATH, vocab)
+    # IMPORTANT: batching assumes same SR. If SR differs, we batch per SR group.
+    by_sr: Dict[int, List[Tuple[Path, np.ndarray]]] = {}
+    for clip_path, sr, audio in loaded:
+        by_sr.setdefault(sr, []).append((clip_path, audio))
+
+    # If model exposes its device, use it; otherwise rely on model internals.
+    # We still prepare tensors on CPU and let asr_model handle GPU transfer if it wants.
+    for sr, items in by_sr.items():
+        # sort by length (descending helps reduce pad waste if you later bucket)
+        items.sort(key=lambda x: x[1].shape[0], reverse=True)
+
+        # Make variable-sized batches but cap by total seconds too (prevents giant pads)
+        current: List[Tuple[Path, np.ndarray]] = []
+        current_samples = 0
+        max_samples_per_batch = int(max_batch_seconds * sr)
+
+        def flush_batch(batch_items: List[Tuple[Path, np.ndarray]]):
+            nonlocal processed, accepted
+
+            # Build arrays + keys + existing
+            keys = [p.name for p, _ in batch_items]
+            waves = [a.astype(np.float32, copy=False) for _, a in batch_items]
+
+            # Per-entry metadata we need even if inference fails
+            existing_list = [(clip_db.get(k) or {}) for k in keys]
+            uids = [ensure_uid(ex, k) for ex, k in zip(existing_list, keys)]
+
+            try:
+                if has_batch:
+                    # Expect: returns list[ASRResult]-like objects aligned to inputs
+                    # You can pass use_amp to let asr_model use autocast on CUDA
+                    results: List[ASRResult] = asr_model.transcribe_batch(
+                        sr,
+                        waves,
+                        use_amp=use_amp,
+                    )
+                else:
+                    results = [asr_model.transcribe(sr, w) for w in waves]
+
+                for k, w, ex, uid, r in zip(keys, waves, existing_list, uids, results):
+                    model_transcript = (getattr(r, "transcript", "") or "").strip()
+                    conf = float(getattr(r, "confidence", 0.0) or 0.0)
+
+                    if should_auto_accept(model_transcript, conf, threshold):
+                        clip_db[k] = {
+                            "uid": uid,
+                            "transcript": model_transcript,
+                            "confidence": conf,
+                            "label": "speech",
+                            "confirmed": True,
+                        }
+                        update_vocab_from_transcript(model_transcript, vocab)
+                        accepted += 1
+                    else:
+                        clip_db[k] = {
+                            "uid": uid,
+                            "transcript": ex.get("transcript"),
+                            "confidence": ex.get("confidence", 0.0),
+                            "label": ex.get("label"),
+                            "confirmed": bool(ex.get("confirmed", False)),
+                            "model_suggestion": model_transcript,
+                            "model_confidence": conf,
+                        }
+
+                    processed += 1
+
+            except Exception as e:
+                # If batch inference fails, fall back to per-item (keeps robustness)
+                for k, w, ex, uid in zip(keys, waves, existing_list, uids):
+                    try:
+                        r = asr_model.transcribe(sr, w)
+                        model_transcript = (getattr(r, "transcript", "") or "").strip()
+                        conf = float(getattr(r, "confidence", 0.0) or 0.0)
+
+                        if should_auto_accept(model_transcript, conf, threshold):
+                            clip_db[k] = {
+                                "uid": uid,
+                                "transcript": model_transcript,
+                                "confidence": conf,
+                                "label": "speech",
+                                "confirmed": True,
+                            }
+                            update_vocab_from_transcript(model_transcript, vocab)
+                            accepted += 1
+                        else:
+                            clip_db[k] = {
+                                "uid": uid,
+                                "transcript": ex.get("transcript"),
+                                "confidence": ex.get("confidence", 0.0),
+                                "label": ex.get("label"),
+                                "confirmed": bool(ex.get("confirmed", False)),
+                                "model_suggestion": model_transcript,
+                                "model_confidence": conf,
+                            }
+                        processed += 1
+                    except Exception as e2:
+                        clip_db[k] = {
+                            "uid": uid,
+                            "transcript": ex.get("transcript"),
+                            "confidence": ex.get("confidence", 0.0),
+                            "label": ex.get("label", "unlabeled"),
+                            "confirmed": bool(ex.get("confirmed", False)),
+                            "error": f"batch_error={e} item_error={e2}",
+                        }
+                        processed += 1
+
+            if processed % save_every == 0:
+                save_json(CLIP_DB_PATH, clip_db)
+                save_json(VOCAB_PATH, vocab)
+
+        for clip_path, audio in tqdm(items, desc=f"Auto-labeling (sr={sr})"):
+            n = int(audio.shape[0])
+            # start new batch if we exceed limits
+            would_exceed_count = (len(current) + 1) > batch_size
+            would_exceed_samples = (current_samples + n) > max_samples_per_batch
+            if current and (would_exceed_count or would_exceed_samples):
+                flush_batch(current)
+                current = []
+                current_samples = 0
+
+            current.append((clip_path, audio))
+            current_samples += n
+
+        if current:
+            flush_batch(current)
 
     save_json(CLIP_DB_PATH, clip_db)
     save_json(VOCAB_PATH, vocab)
@@ -597,6 +783,7 @@ def auto_label_clips(
     print(f"Auto-accepted (speech)  : {accepted}")
     print(f"Skipped confirmed speech: {skipped_confirmed_speech}")
     print(f"Threshold               : {threshold:.2f}")
+    print(f"Batch size              : {batch_size}")
 
 
 def continuous_utterance_record_and_transcribe(
